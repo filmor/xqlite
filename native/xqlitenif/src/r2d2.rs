@@ -1,18 +1,17 @@
 use crate::atoms::{
-    atom, binary, cannot_allocate_binary, cannot_convert_atom_to_string,
-    cannot_convert_to_sqlite_value, cannot_execute, cannot_execute_pragma, cannot_fetch_row,
-    cannot_open_database, cannot_prepare_statement, cannot_read_column, connection_not_found,
-    expected_keyword_list, expected_keyword_tuple, float, fun, integer, list, map, pid, port,
-    r#false, r#true, reference, timeout, tuple, unknown, unsupported_atom,
-    unsupported_data_type,
+    atom, binary, cannot_convert_atom_to_string, cannot_convert_to_sqlite_value,
+    cannot_execute, cannot_execute_pragma, cannot_fetch_row, cannot_open_database,
+    cannot_prepare_statement, cannot_read_column, connection_not_found, expected_keyword_list,
+    expected_keyword_tuple, float, fun, integer, list, map, pid, port, r#false, r#true,
+    reference, timeout, tuple, unknown, unsupported_atom, unsupported_data_type,
 };
 use dashmap::DashMap;
 use r2d2::{ManageConnection, Pool};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{types::Value, ToSql};
-use rustler::types::atom::{error, nil};
+use rustler::types::atom::nil;
 use rustler::{resource_impl, Atom, Binary, ListIterator, TermType};
-use rustler::{Encoder, Env, Error as RustlerError, OwnedBinary, Resource, ResourceArc, Term};
+use rustler::{Encoder, Env, Error as RustlerError, Resource, ResourceArc, Term};
 use std::fmt::{self, Debug, Display};
 use std::panic::RefUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,39 +20,29 @@ use std::sync::OnceLock;
 type XqlitePool = Pool<SqliteConnectionManager>;
 type XqlitePools = DashMap<u64, XqlitePool>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct XqliteConn(u64);
+
 #[resource_impl]
 impl Resource for XqliteConn {}
-impl Copy for XqliteConn {}
-impl Clone for XqliteConn {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl Encoder for XqliteConn {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        self.0.encode(env)
-    }
-}
 
-#[derive(Debug)]
-pub(crate) struct XqliteVal(rusqlite::types::Value);
+#[derive(Debug, Clone)]
+pub(crate) struct WrappedVec(Vec<u8>);
 
-impl Encoder for XqliteVal {
-    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
-        match &self.0 {
-            rusqlite::types::Value::Null => nil().encode(env),
-            rusqlite::types::Value::Integer(i) => i.encode(env),
-            rusqlite::types::Value::Real(f) => f.encode(env),
-            rusqlite::types::Value::Text(s) => s.encode(env),
-            rusqlite::types::Value::Blob(b) => match OwnedBinary::new(b.len()) {
-                Some(mut owned_binary) => {
-                    owned_binary.as_mut_slice().copy_from_slice(b);
-                    owned_binary.release(env).encode(env)
-                }
-                None => (error(), XqliteError::CannotAllocateBinary).encode(env),
-            },
+#[resource_impl]
+impl Resource for WrappedVec {}
+
+fn encode_val<'a>(env: Env<'a>, val: rusqlite::types::Value) -> Term<'a> {
+    use rusqlite::types::Value;
+    match val {
+        Value::Null => nil().encode(env),
+        Value::Integer(i) => i.encode(env),
+        Value::Real(f) => f.encode(env),
+        Value::Text(s) => s.encode(env),
+        Value::Blob(b) => {
+            let resource = ResourceArc::new(WrappedVec(b));
+            let bin = resource.make_binary(env, |w| &w.0);
+            bin.encode(env)
         }
     }
 }
@@ -106,7 +95,6 @@ pub(crate) enum XqliteError {
     CannotExecute(String),
     CannotExecutePragma { pragma: String, reason: String },
     CannotFetchRow(String),
-    CannotAllocateBinary,
     CannotOpenDatabase(String, String),
     CannotConvertAtomToString(String),
 }
@@ -160,7 +148,6 @@ impl Display for XqliteError {
                 write!(f, "Cannot execute PRAGMA '{}': {}", pragma, reason)
             }
             XqliteError::CannotFetchRow(reason) => write!(f, "Cannot fetch row: {}", reason),
-            XqliteError::CannotAllocateBinary => write!(f, "Cannot allocate binary for blob"),
             XqliteError::CannotOpenDatabase(path, reason) => {
                 write!(f, "Cannot open database '{}': {}", path, reason)
             }
@@ -188,7 +175,7 @@ impl Encoder for XqliteError {
                 (unsupported_data_type(), term_type_to_atom(env, *term_type)).encode(env)
             }
             XqliteError::ConnectionNotFound(conn) => {
-                (connection_not_found(), conn).encode(env)
+                (connection_not_found(), ResourceArc::new(*conn)).encode(env)
             }
             XqliteError::Timeout(reason) => (timeout(), reason).encode(env),
             XqliteError::CannotPrepareStatement(sql, reason) => {
@@ -202,7 +189,6 @@ impl Encoder for XqliteError {
                 (cannot_execute_pragma(), pragma, reason).encode(env)
             }
             XqliteError::CannotFetchRow(reason) => (cannot_fetch_row(), reason).encode(env),
-            XqliteError::CannotAllocateBinary => cannot_allocate_binary().encode(env),
             XqliteError::CannotOpenDatabase(path, reason) => {
                 (cannot_open_database(), path, reason).encode(env)
             }
@@ -363,7 +349,7 @@ fn raw_exec<'a>(
     handle: &XqliteConn,
     sql: &str,
     params_term: Term<'a>,
-) -> Result<Vec<Vec<XqliteVal>>, XqliteError> {
+) -> Result<Vec<Vec<Term<'a>>>, XqliteError> {
     let pool = get_pool(handle.0).ok_or(XqliteError::ConnectionNotFound(*handle))?;
     let conn = pool.get()?;
     let named_params_vec = decode_keyword_params(env, params_term)?;
@@ -382,18 +368,18 @@ fn raw_exec<'a>(
 
     let mut rows = stmt.query(params_for_rusqlite.as_slice())?;
 
-    let mut results: Vec<Vec<XqliteVal>> = Vec::new();
+    let mut results: Vec<Vec<Term<'a>>> = Vec::new();
 
     while let Some(row) = rows
         .next()
         .map_err(|e| XqliteError::CannotFetchRow(e.to_string()))?
     {
-        let mut row_values: Vec<XqliteVal> = Vec::with_capacity(column_count);
+        let mut row_values = Vec::with_capacity(column_count);
         for i in 0..column_count {
             let value = row
                 .get::<usize, Value>(i)
                 .map_err(|e| XqliteError::CannotReadColumn(i, e.to_string()))?;
-            row_values.push(XqliteVal(value));
+            row_values.push(encode_val(env, value));
         }
         results.push(row_values);
     }
